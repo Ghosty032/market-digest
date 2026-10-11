@@ -1,0 +1,613 @@
+{
+  "name": "Market Digest - Send",
+  "nodes": [
+    {
+      "id": "280a4a78-749b-52a8-8fec-e987a4a10a23",
+      "name": "10:00 and 16:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 10,16 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "0fbfa291-d27d-5822-b0a3-5b9ddc3cd271",
+      "name": "Test (send to me)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -200
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "3f08c64e-0792-59e3-91a6-d253d4839e2d",
+      "name": "Fetch Unsent",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=WITH c AS (\n  SELECT max(fetched_at) AS cutoff FROM articles\n  WHERE sent = false AND category <> 'uncategorised'\n)\nSELECT a.url, a.source, a.title, a.category, c.cutoff::text AS cutoff\nFROM articles a, c\nWHERE a.category <> 'uncategorised' AND (\n  (a.sent = false AND a.fetched_at <= c.cutoff)\n  -- test runs also include the last 24h of already-sent articles, so there is always something to test with\n  OR ({{ $('Test (send to me)').isExecuted ? 'TRUE' : 'FALSE' }} AND a.fetched_at > now() - interval '24 hours')\n)\nORDER BY a.category, a.fetched_at DESC;",
+        "options": {}
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "f36c4a52-fcbd-57a1-b1cb-8ba6fb4eb3c1",
+      "name": "Build Digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Groups unsent articles by category into a print-ready HTML page for Gotenberg.\n// ===== SETTINGS =====\nconst TEST_CHAT  = 'YOUR_PRIVATE_CHAT_ID';        // your private chat\nconst GROUP_CHAT = '-100XXXXXXXXXX';    // the group\nconst MAX_PER_CATEGORY = 8;             // cap per category; picks alternate between sources so one site can't fill it\n// ====================\n// Where it goes:\n//   \"Test (send to me)\" trigger          -> your private chat, labelled [TEST], marks nothing\n//   \"10:00 and 16:00\" trigger            -> group, marks articles as sent\n//      (on schedule, or when you run it by hand from that trigger = \"send to group now\")\n\nconst IS_TEST = (() => { try { return $('Test (send to me)').isExecuted; } catch (e) { return false; } })();\nconst CHAT_ID = IS_TEST ? TEST_CHAT : GROUP_CHAT;\nconst ORDER = ['SEBI & AMFI', 'Insurance', 'Global News', 'US Market', 'Indian Market', 'MF Industry'];\n\nconst rows = $input.all().map(i => i.json).filter(r => r.url);\nconst now = $now.setZone('Asia/Kolkata');\nconst label = (IS_TEST ? '[TEST] ' : '') + (now.hour < 13 ? 'Morning Digest' : 'Afternoon Digest');\nconst stamp = now.toFormat('dd LLL yyyy, HH:mm');\n\nif (!rows.length) {\n  return [{ json: { empty: true, chatId: CHAT_ID, isTest: IS_TEST, testChat: TEST_CHAT,\n    text: `${label} | ${stamp}\\nNo new articles in your categories.` } }];\n}\n\nconst SOURCE_LABEL = { cafemutual: 'Cafemutual', moneycontrol: 'Moneycontrol', cnbctv18: 'CNBC TV18' };\nconst esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;');\nconst all = {};\nrows.forEach(r => (all[r.category] ??= []).push(r));\n// Round-robin across sources (newest first within each) so every source gets a share of each category.\nconst groups = {};\nfor (const [cat, list] of Object.entries(all)) {\n  const bySource = {};\n  list.forEach(r => (bySource[r.source] ??= []).push(r));\n  const queues = Object.values(bySource);\n  const picked = [];\n  while (picked.length < MAX_PER_CATEGORY && queues.some(q => q.length)) {\n    for (const q of queues) if (q.length && picked.length < MAX_PER_CATEGORY) picked.push(q.shift());\n  }\n  groups[cat] = picked;\n}\nconst shownCount = Object.values(groups).reduce((n, g) => n + g.length, 0);\nconst cats = [...ORDER.filter(c => groups[c]), ...Object.keys(groups).filter(c => !ORDER.includes(c))];\n\nconst sections = cats.map(c => `\n  <section>\n    <h2>${esc(c)} <span class=\"count\">${groups[c].length}</span></h2>\n    <ol>${groups[c].map(r => `\n      <li><a href=\"${esc(r.url)}\">${esc(r.title)}</a><span class=\"src\">${esc(SOURCE_LABEL[r.source] || r.source)}</span></li>`).join('')}\n    </ol>\n  </section>`).join('');\n\nconst html = `<!doctype html><html><head><meta charset=\"utf-8\"><title>${label}</title><style>\n  @page { size: A4; margin: 16mm 14mm; }\n  body { font-family: Arial, Helvetica, sans-serif; color: #1c2230; font-size: 10.5pt; margin: 0; }\n  header { border-bottom: 2px solid #16233F; padding-bottom: 8px; margin-bottom: 14px; }\n  header h1 { font-size: 18pt; margin: 0; color: #16233F; }\n  header p { margin: 4px 0 0; color: #5A7099; font-size: 9.5pt; }\n  h2 { font-size: 12.5pt; color: #16233F; margin: 16px 0 6px; padding-bottom: 3px; border-bottom: 1px solid #B8860B; }\n  .count { font-size: 9pt; color: #fff; background: #2C4470; border-radius: 8px; padding: 1px 7px; vertical-align: middle; }\n  ol { margin: 0; padding-left: 20px; }\n  li { margin: 0 0 6px; line-height: 1.35; page-break-inside: avoid; }\n  a { color: #1c2230; text-decoration: none; }\n  .src { color: #8a93a6; font-size: 8.5pt; margin-left: 6px; }\n  footer { margin-top: 18px; font-size: 8pt; color: #8a93a6; }\n</style></head><body>\n  <header><h1>${label}</h1><p>${stamp} IST &middot; ${shownCount} articles</p></header>\n  ${sections}\n  <footer>Headlines and links only. Read full articles on the source sites.</footer>\n</body></html>`;\n\nconst caption = `${label} | ${stamp}\\n` + cats.map(c => `${c}: ${groups[c].length}`).join('\\n');\n\nreturn [{\n  json: {\n    empty: false, chatId: CHAT_ID, caption, isTest: IS_TEST, testChat: TEST_CHAT,\n    cutoff: IS_TEST ? '1970-01-01' : rows[0].cutoff,   // test runs don't mark anything as sent\n    fileName: `${label.replace('[TEST] ', 'TEST-').replace(' ', '-')}-${now.toFormat('yyyy-LL-dd-HHmm')}`,\n  },\n  binary: {\n    data: { data: Buffer.from(html, 'utf8').toString('base64'), mimeType: 'text/html', fileName: 'index.html', fileExtension: 'html' },\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "e3f9ba50-6ec2-5e27-b728-4a0f6f36faed",
+      "name": "Nothing New?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        660,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.empty }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "da6743b6-83ce-5f3d-ac00-e0a75b8b49fe",
+      "name": "Send 'No News'",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        900,
+        -120
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      }
+    },
+    {
+      "id": "26e9d31f-1bd6-54db-8fa4-eb656c5d15e1",
+      "name": "HTML to PDF",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        900,
+        100
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://gotenberg:3000/forms/chromium/convert/html",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Gotenberg-Output-Filename",
+              "value": "={{ $json.fileName }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "files",
+              "inputDataFieldName": "data"
+            },
+            {
+              "name": "preferCssPageSize",
+              "value": "true"
+            },
+            {
+              "name": "printBackground",
+              "value": "true"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "data"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "e6e14ac1-80cd-5329-b214-2ecf6df54003",
+      "name": "Send PDF",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1120,
+        100
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendDocument",
+        "chatId": "={{ $('Build Digest').first().json.chatId }}",
+        "binaryData": true,
+        "binaryPropertyName": "data",
+        "additionalFields": {
+          "caption": "={{ $('Build Digest').first().json.caption }}",
+          "appendAttribution": false
+        }
+      }
+    },
+    {
+      "id": "cbf848e6-780b-53da-b458-7606c1e7659b",
+      "name": "Mark Sent",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1340,
+        100
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=UPDATE articles SET sent = true\nWHERE sent = false AND category <> 'uncategorised'\n  AND fetched_at <= '{{ $('Build Digest').first().json.cutoff }}'::timestamptz;",
+        "options": {}
+      },
+      "executeOnce": true
+    },
+    {
+      "id": "e92a2d69-8d3d-541d-8ec0-cccbda409b84",
+      "name": "Debate Queries",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        420
+      ],
+      "parameters": {
+        "jsCode": "// Google News search feeds for debate-worthy finance stories (last 24h, India edition).\n// ===== SETTINGS =====\nconst DRAFT_ON = 'morning';      // which scheduled run drafts: 'morning' | 'afternoon' | 'both' (manual runs always draft)\nconst QUERIES = [\n  'SEBI order OR penalty OR ban',\n  'SEBI new rules investors',\n  'finfluencer SEBI',\n  'mutual fund charges OR \"expense ratio\" OR \"exit load\"',\n  'IRDAI penalty OR mis-selling OR \"claim rejection\"',\n  'income tax investors OR LTCG OR STT',\n  'RBI repo rate OR EMI OR loan rates',\n  'IPO listing loss OR IPO controversy',\n  'India tariff OR trade deal',\n  'bank fraud OR NPA OR \"wilful defaulter\"',\n];\n// ====================\n\nconst d = $('Build Digest').first().json;\nconst isMorning = $now.setZone('Asia/Kolkata').hour < 13;\nconst scheduledMatch = DRAFT_ON === 'both' || (DRAFT_ON === 'morning') === isMorning;\nif (!d.isTest && !scheduledMatch) return [];            // not a drafting run: stop here\n\nreturn QUERIES.map(q => ({ json: {\n  query: q,\n  url: 'https://news.google.com/rss/search?q=' + encodeURIComponent(q + ' when:1d') + '&hl=en-IN&gl=IN&ceid=IN:en',\n} }));\n"
+      }
+    },
+    {
+      "id": "954f9447-8d65-555a-a96b-be241a0fcc34",
+      "name": "Read Debate News",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.1,
+      "position": [
+        880,
+        420
+      ],
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "options": {}
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "id": "6fe2183c-7db1-504a-9679-0d507488361d",
+      "name": "Pick Draft Topic",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        420
+      ],
+      "parameters": {
+        "jsCode": "// Pools today's digest headlines + Google News debate searches, and asks the model for the 5 most debatable topics.\n// ===== SETTINGS =====\nconst TOPICS = 5;                // topics per day\nconst FROM_DIGEST = 20;          // max headlines taken from today's digest\nconst FROM_SEARCH = 30;          // max headlines taken from the Google News searches\nconst MODEL = 'openai/gpt-oss-120b';      // used only by the raw-API variant; the Groq Model node sets the model\nconst STYLE = 'Punchy and opinionated, but factual. 1-2 relevant hashtags. No emojis.';\n// ====================\n\nconst d = $('Build Digest').first().json;\nconst shuffle = a => [...a].sort(() => Math.random() - 0.5);\nconst norm = s => String(s).toLowerCase().replace(/\\s+-\\s+[^-]+$/, '').replace(/[^a-z0-9 ]/g, '').trim();\n\n// Skip stories already used on earlier days (kept in workflow memory; saved on scheduled runs).\nconst memory = $getWorkflowStaticData('global');\nconst used = new Set(memory.usedTopics || []);\n\nconst digest = $('Fetch Unsent').all().map(i => i.json)\n  .filter(r => r.url && r.title)\n  .map(r => ({ title: r.title, url: r.url, from: r.category }));\nconst search = $input.all().map(i => i.json)\n  .filter(j => !j.error && j.title && j.link)\n  .map(j => ({ title: String(j.title).trim(), url: j.link, from: 'News search' }));\n\nconst seen = new Set();\nconst pool = [];\nfor (const c of [...shuffle(digest).slice(0, FROM_DIGEST), ...shuffle(search).slice(0, FROM_SEARCH)]) {\n  const k = norm(c.title);\n  if (!k || seen.has(k) || used.has(k)) continue;\n  seen.add(k);\n  pool.push(c);\n}\nif (pool.length < TOPICS) return [{ json: { chatId: d.testChat, error: `Only ${pool.length} candidate stories today; drafts skipped.` } }];\n\nconst system = [\n  'You write X (Twitter) posts for a general finance news and commentary page in India.',\n  'Goal: spark debate and replies on genuinely contested finance stories, while staying factual and legally safe.',\n  'Prefer stories that divide opinion: rules that affect investors, costs passed to customers, regulatory penalties,',\n  'policy U-turns, tax changes, tariffs or trade fights, clear winners vs losers. Pick different stories, not five versions of one.',\n  'Rules:',\n  '- Stick to facts in the headline. Never invent numbers, names, quotes or motives.',\n  '- Criticise decisions and policies, never people. No insults. Call allegations \"alleged\" unless proven.',\n  '- No investment advice, buy/sell calls, price targets, return predictions or hype about specific stocks or funds.',\n  '- Nothing on religion, caste, communities or party politics.',\n  '- Frame the debate; do not present opinion as fact.',\n  '- Each post under 260 characters including hashtags. Plain text, no markdown.',\n  `- Style: ${STYLE}`,\n  'Respond in JSON only.',\n].join('\\n');\n\nconst user = [\n  'Headlines:',\n  ...pool.map((p, i) => `${i + 1}. ${p.title}`),\n  '',\n  `Choose the ${TOPICS} most debatable headlines. For each, write:`,\n  '- \"hot_take\": a bold post that invites disagreement,',\n  '- \"poll\": a poll-style question with 2-3 short options on separate lines.',\n  'Return JSON: {\"topics\":[{\"pick\":<headline number>,\"why\":\"<under 15 words: why people will argue>\",\"hot_take\":\"...\",\"poll\":\"...\"}]}',\n].join('\\n');\n\nreturn [{\n  json: {\n    pool, chatId: d.chatId, testChat: d.testChat, isTest: d.isTest,\n    systemPrompt: system, userPrompt: user,\n    body: { model: MODEL, temperature: 0.8, max_tokens: 1800, response_format: { type: 'json_object' },\n            messages: [{ role: 'system', content: system }, { role: 'user', content: user }] },\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "b3faf77f-0db1-5695-a28a-e2b6461a1541",
+      "name": "Groq Draft",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.4,
+      "position": [
+        1320,
+        420
+      ],
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.userPrompt }}",
+        "messages": {
+          "messageValues": [
+            {
+              "message": "={{ $json.systemPrompt }}"
+            }
+          ]
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "ac40acd1-ab65-51a5-b9cf-b21b24951335",
+      "name": "Groq Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        1320,
+        640
+      ],
+      "parameters": {
+        "model": "openai/gpt-oss-120b",
+        "options": {
+          "temperature": 0.8,
+          "maxTokensToSample": 1800
+        }
+      }
+    },
+    {
+      "id": "99036c0a-934f-5608-8488-c8569aadaced",
+      "name": "Format Draft",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        420
+      ],
+      "parameters": {
+        "jsCode": "// Builds the X drafts as a print-ready HTML page (converted to PDF next). Errors go only to your private chat.\nconst t = $('Pick Draft Topic').first().json;\nconst fail = msg => [{ json: { ok: false, chatId: t.testChat, text: `X drafts: ${msg}` } }];\nif (t.error) return fail(t.error);\n\nconst r = $input.first().json;\nconst raw = r?.text ?? r?.choices?.[0]?.message?.content;   // LLM Chain node or raw API reply\nlet topics = [];\ntry {\n  const s = String(raw);\n  topics = JSON.parse(s.slice(s.indexOf('{'), s.lastIndexOf('}') + 1)).topics || [];\n} catch (e) { /* handled below */ }\nif (!topics.length) {\n  const err = r?.error?.message || r?.error || r?.message || String(raw || JSON.stringify(r)).slice(0, 300);\n  return fail(`generation failed: ${err}`);\n}\n\nconst now = $now.setZone('Asia/Kolkata');\nconst date = now.toFormat('dd LLL yyyy');\nconst esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;');\nconst count = s => [...String(s || '').trim()].length;\nconst badge = s => `<span class=\"chars${count(s) > 280 ? ' over' : ''}\">${count(s)} / 280</span>`;\n\nconst usedNow = [];\nconst cards = topics.map((x, i) => {\n  const story = t.pool[(parseInt(x.pick, 10) || 0) - 1];\n  if (story) usedNow.push(story.title);\n  return `\n  <section class=\"topic\">\n    <div class=\"num\">${i + 1}</div>\n    <div class=\"body\">\n      ${x.why ? `<p class=\"why\">${esc(x.why)}</p>` : ''}\n      ${story\n        ? `<p class=\"src\"><a href=\"${esc(story.url)}\">${esc(story.title)}</a></p>`\n        : '<p class=\"src missing\">Source headline not identified. Check before posting.</p>'}\n      <div class=\"post\"><div class=\"label\">Hot take ${badge(x.hot_take)}</div><div class=\"text\">${esc(String(x.hot_take || '').trim())}</div></div>\n      <div class=\"post\"><div class=\"label\">Poll ${badge(x.poll)}</div><div class=\"text\">${esc(String(x.poll || '').trim())}</div></div>\n    </div>\n  </section>`;\n}).join('');\n\nconst title = `${t.isTest ? '[TEST] ' : ''}X Debate Drafts`;\nconst html = `<!doctype html><html><head><meta charset=\"utf-8\"><title>${title}</title><style>\n  @page { size: A4; margin: 14mm 14mm; }\n  body { font-family: Arial, Helvetica, sans-serif; color: #1c2230; font-size: 10.5pt; margin: 0; }\n  header { border-bottom: 2px solid #16233F; padding-bottom: 8px; margin-bottom: 12px; }\n  header h1 { font-size: 18pt; margin: 0; color: #16233F; }\n  header p { margin: 4px 0 0; color: #5A7099; font-size: 9.5pt; }\n  .topic { display: flex; gap: 10px; border: 1px solid #d9dee8; border-radius: 6px; padding: 10px 12px; margin-bottom: 10px; page-break-inside: avoid; }\n  .num { flex: 0 0 26px; height: 26px; border-radius: 13px; background: #16233F; color: #fff; font-weight: bold; text-align: center; line-height: 26px; }\n  .body { flex: 1; min-width: 0; }\n  .why { margin: 0 0 4px; font-weight: bold; color: #16233F; }\n  .src { margin: 0 0 8px; font-size: 9.5pt; overflow-wrap: anywhere; }\n  .src a { color: #2C4470; text-decoration: none; }\n  .src.missing { color: #b42318; }\n  .post { margin-top: 6px; }\n  .label { font-size: 8.5pt; text-transform: uppercase; letter-spacing: .4px; color: #5A7099; margin-bottom: 2px; }\n  .text { white-space: pre-wrap; overflow-wrap: anywhere; background: #f5f7fb; border-left: 3px solid #B8860B; padding: 6px 8px; line-height: 1.4; }\n  .chars { float: right; text-transform: none; color: #8a93a6; }\n  .chars.over { color: #b42318; font-weight: bold; }\n  footer { margin-top: 12px; font-size: 8pt; color: #8a93a6; }\n</style></head><body>\n  <header><h1>${title}</h1><p>${date} &middot; ${topics.length} topics &middot; Verify facts in each source article before posting.</p></header>\n  ${cards}\n  <footer>AI-generated drafts for internal review. Commentary only; not investment advice.</footer>\n</body></html>`;\n\n// Remember used stories so they are not picked again (last 200; saved on scheduled runs).\nconst norm = s => String(s).toLowerCase().replace(/\\s+-\\s+[^-]+$/, '').replace(/[^a-z0-9 ]/g, '').trim();\nconst memory = $getWorkflowStaticData('global');\nmemory.usedTopics = [...(memory.usedTopics || []), ...usedNow.map(norm)].slice(-200);\n\nreturn [{\n  json: {\n    ok: true, chatId: t.chatId,\n    caption: `${title} | ${date} | ${topics.length} topics`,\n    fileName: `${t.isTest ? 'TEST-' : ''}X-Drafts-${now.toFormat('yyyy-LL-dd')}`,\n  },\n  binary: { data: { data: Buffer.from(html, 'utf8').toString('base64'), mimeType: 'text/html', fileName: 'index.html', fileExtension: 'html' } },\n}];\n"
+      }
+    },
+    {
+      "id": "344246b0-253c-5599-a0b0-3ee389f4882a",
+      "name": "Draft OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1760,
+        420
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "d1",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "d545e1b5-9850-587d-bcc1-774d338e9c83",
+      "name": "Drafts to PDF",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1980,
+        340
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://gotenberg:3000/forms/chromium/convert/html",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Gotenberg-Output-Filename",
+              "value": "={{ $json.fileName }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "files",
+              "inputDataFieldName": "data"
+            },
+            {
+              "name": "preferCssPageSize",
+              "value": "true"
+            },
+            {
+              "name": "printBackground",
+              "value": "true"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "data"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "65232546-cab2-50fa-b2ea-dd9267300913",
+      "name": "Send Drafts PDF",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2200,
+        340
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendDocument",
+        "chatId": "={{ $('Format Draft').first().json.chatId }}",
+        "binaryData": true,
+        "binaryPropertyName": "data",
+        "additionalFields": {
+          "caption": "={{ $('Format Draft').first().json.caption }}",
+          "appendAttribution": false
+        }
+      }
+    },
+    {
+      "id": "b110b091-2845-51b8-834e-9f7430698077",
+      "name": "Send Draft Error",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1980,
+        520
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      }
+    }
+  ],
+  "connections": {
+    "10:00 and 16:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch Unsent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Unsent": {
+      "main": [
+        [
+          {
+            "node": "Build Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Digest": {
+      "main": [
+        [
+          {
+            "node": "Nothing New?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Debate Queries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Test (send to me)": {
+      "main": [
+        [
+          {
+            "node": "Fetch Unsent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Nothing New?": {
+      "main": [
+        [
+          {
+            "node": "Send 'No News'",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "HTML to PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTML to PDF": {
+      "main": [
+        [
+          {
+            "node": "Send PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send PDF": {
+      "main": [
+        [
+          {
+            "node": "Mark Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Debate Queries": {
+      "main": [
+        [
+          {
+            "node": "Read Debate News",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Debate News": {
+      "main": [
+        [
+          {
+            "node": "Pick Draft Topic",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick Draft Topic": {
+      "main": [
+        [
+          {
+            "node": "Groq Draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq Draft": {
+      "main": [
+        [
+          {
+            "node": "Format Draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Draft": {
+      "main": [
+        [
+          {
+            "node": "Draft OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft OK?": {
+      "main": [
+        [
+          {
+            "node": "Drafts to PDF",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Draft Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drafts to PDF": {
+      "main": [
+        [
+          {
+            "node": "Send Drafts PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Groq Draft",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata"
+  }
+}

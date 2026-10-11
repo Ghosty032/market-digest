@@ -1,0 +1,366 @@
+{
+  "name": "Market Digest - Collector",
+  "nodes": [
+    {
+      "id": "80864982-49e9-5fde-8750-51572c107b90",
+      "name": "Every 30 min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        100
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 30
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "d36a599c-f178-5941-958a-4e95fdf96094",
+      "name": "Fetch Cafemutual",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        240,
+        0
+      ],
+      "parameters": {
+        "url": "https://cafemutual.com/news/archive",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36"
+            },
+            {
+              "name": "Accept-Language",
+              "value": "en-IN,en;q=0.9"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "outputPropertyName": "data"
+            }
+          }
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2
+    },
+    {
+      "id": "35d7ab21-c4db-5073-8993-b2e1472ea50e",
+      "name": "Extract Cafemutual",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Cafemutual: pulls Industry + Insurance article links from the archive page HTML.\nconst decode = s => String(s || '')\n  .replace(/<[^>]+>/g, ' ')\n  .replace(/&amp;/g, '&').replace(/&quot;/g, '\"').replace(/&#0?39;|&apos;|&#x27;/g, \"'\")\n  .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ')\n  .replace(/&[lr]squo;/g, \"'\").replace(/&[lr]dquo;/g, '\"').replace(/&ndash;/g, '-').replace(/&mdash;/g, '-').replace(/&hellip;/g, '...')\n  .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCharCode(parseInt(h, 16)))\n  .replace(/&#(\\d+);/g, (_, n) => String.fromCharCode(n))\n  .replace(/\\s+/g, ' ').trim();\n\nconst PATTERN = /^https:\\/\\/cafemutual\\.com\\/news\\/(industry|insurance)\\/\\d+-/;   // sections to keep\nconst d = $input.first()?.json?.data;\nconst html = typeof d === 'string' ? d : '';\nconst out = new Map();\n\nconst aTag = /<a\\b([^>]*)>([\\s\\S]*?)<\\/a>/gi;\nlet m;\nwhile ((m = aTag.exec(html)) !== null) {\n  const href = (m[1].match(/href\\s*=\\s*[\"']([^\"']+)[\"']/i) || [])[1];\n  if (!href) continue;\n  let url = href.trim().replace(/&amp;/g, '&');\n  if (url.startsWith('/')) url = 'https://cafemutual.com' + url;\n  url = url.split('#')[0].split('?')[0];\n  const pm = url.match(PATTERN);\n  if (!pm) continue;\n  const titleAttr = decode((m[1].match(/title\\s*=\\s*[\"']([^\"']+)[\"']/i) || [])[1]);\n  const text = decode(m[2]);\n  const title = text.length >= titleAttr.length ? text : titleAttr;\n  if (title.length < 15) continue;\n  const prev = out.get(url);\n  if (!prev || title.length > prev.title.length) out.set(url, { source: 'cafemutual', section: pm[1], url, title });\n}\nreturn [...out.values()].map(a => ({ json: a }));\n"
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "e70c7393-0bea-5016-b56b-60bdd81752e5",
+      "name": "MC Feeds",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        200
+      ],
+      "parameters": {
+        "jsCode": "// Moneycontrol RSS feeds. Replace any URL that errors with the feed URLs you used before.\nconst feeds = [\n  { section: 'economy',          url: 'https://www.moneycontrol.com/rss/economy.xml' },\n  { section: 'mutual-funds',     url: 'https://www.moneycontrol.com/rss/mfnews.xml' },\n  { section: 'personal-finance', url: 'https://www.moneycontrol.com/rss/personalfinance.xml' },\n  { section: 'world',            url: 'https://www.moneycontrol.com/rss/internationalmarkets.xml' },\n  { section: 'markets',          url: 'https://www.moneycontrol.com/rss/marketreports.xml' },\n];\nreturn feeds.map(f => ({ json: f }));\n"
+      }
+    },
+    {
+      "id": "57ac2b8d-fa05-561c-8997-28c2fceaf4e6",
+      "name": "Read MC RSS",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.1,
+      "position": [
+        480,
+        200
+      ],
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "options": {}
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "a775fd86-057f-5a09-9fc7-ca41a7544f19",
+      "name": "Normalise MC",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        200
+      ],
+      "parameters": {
+        "jsCode": "// Moneycontrol: maps RSS Read output to the common article shape. Failed feeds are skipped.\nconst feeds = $('MC Feeds').all();\nconst out = new Map();\nfor (const item of $input.all()) {\n  const j = item.json;\n  if (j.error || !j.title || !j.link) continue;\n  const feed = feeds[item.pairedItem?.item ?? 0]?.json || {};\n  const url = String(j.link).trim().split('#')[0].split('?')[0];\n  const title = String(j.title).replace(/\\s+/g, ' ').trim();\n  if (title.length < 15) continue;\n  out.set(url, { source: 'moneycontrol', section: feed.section || 'rss', url, title });\n}\nreturn [...out.values()].map(a => ({ json: a }));\n"
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "6963942f-419a-5807-b446-e011af4959c8",
+      "name": "CNBC Feeds",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        400
+      ],
+      "parameters": {
+        "jsCode": "// CNBC TV18 RSS feeds. market.xml is confirmed; the others follow the same URL pattern and are skipped if they fail.\n// Check the RSS link in cnbctv18.com's footer and replace/add URLs as needed.\nconst feeds = [\n  { section: 'market',   url: 'https://www.cnbctv18.com/commonfeeds/v1/cne/rss/market.xml' },\n  { section: 'economy',  url: 'https://www.cnbctv18.com/commonfeeds/v1/cne/rss/economy.xml' },\n  { section: 'business', url: 'https://www.cnbctv18.com/commonfeeds/v1/cne/rss/business.xml' },\n  { section: 'world',    url: 'https://www.cnbctv18.com/commonfeeds/v1/cne/rss/world.xml' },\n];\nreturn feeds.map(f => ({ json: f }));\n"
+      }
+    },
+    {
+      "id": "46140120-1fe7-55e4-b29b-0a8dc6edcb7c",
+      "name": "Read CNBC RSS",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.1,
+      "position": [
+        480,
+        400
+      ],
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "options": {}
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "8b16177e-fe71-5240-bdd0-282bbbe1e78f",
+      "name": "Normalise CNBC",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        400
+      ],
+      "parameters": {
+        "jsCode": "// CNBC TV18: maps RSS Read output to the common article shape. Failed feeds are skipped.\nconst feeds = $('CNBC Feeds').all();\nconst out = new Map();\nfor (const item of $input.all()) {\n  const j = item.json;\n  if (j.error || !j.title || !j.link) continue;\n  const feed = feeds[item.pairedItem?.item ?? 0]?.json || {};\n  const url = String(j.link).trim().split('#')[0].split('?')[0];\n  const title = String(j.title).replace(/\\s+/g, ' ').trim();\n  if (title.length < 15) continue;\n  out.set(url, { source: 'cnbctv18', section: feed.section || 'rss', url, title });\n}\nreturn [...out.values()].map(a => ({ json: a }));\n"
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "e5cd890d-02e0-5905-a222-3fdfc020bc6b",
+      "name": "Merge",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        960,
+        200
+      ],
+      "parameters": {
+        "numberInputs": 3
+      }
+    },
+    {
+      "id": "f44d16d1-0f4a-5c2d-9a6b-5cd6c726d1d0",
+      "name": "Load Rules",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1180,
+        100
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT priority, category, pattern, case_sensitive, source FROM category_rules;",
+        "options": {}
+      },
+      "executeOnce": true
+    },
+    {
+      "id": "70164c36-6ff1-5781-b307-6392a6c06e8a",
+      "name": "Categorise",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1400,
+        100
+      ],
+      "parameters": {
+        "jsCode": "// First matching rule by priority wins. Builds one bulk INSERT; existing URLs are skipped.\nconst rules = $input.all().map(r => r.json)\n  .filter(r => r.pattern)\n  .sort((a, b) => a.priority - b.priority)\n  .map(r => ({ category: r.category, source: r.source || null, re: new RegExp(r.pattern, r.case_sensitive ? '' : 'i') }));\n\nconst articles = $('Merge').all().map(a => a.json).filter(a => a.url && a.title);\nif (!articles.length) return [];\n\nconst q = v => `'${String(v).replace(/'/g, \"''\")}'`;\nconst rows = articles.map(a => {\n  const hit = rules.find(r => (!r.source || r.source === a.source) && r.re.test(a.title));\n  const category = hit ? hit.category : 'uncategorised';\n  return `(${q(a.url)}, ${q(a.source)}, ${q(a.section)}, ${q(a.title)}, ${q(category)})`;\n});\n\nconst sql = `INSERT INTO articles (url, source, section, title, category) VALUES\\n${rows.join(',\\n')}\\nON CONFLICT (url) DO NOTHING;`;\nreturn [{ json: { sql, scanned: articles.length } }];\n"
+      }
+    },
+    {
+      "id": "f9f720e8-6b70-5e35-8d73-011b48cddb67",
+      "name": "Save New Articles",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1620,
+        100
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.sql }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Every 30 min": {
+      "main": [
+        [
+          {
+            "node": "Fetch Cafemutual",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "MC Feeds",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "CNBC Feeds",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CNBC Feeds": {
+      "main": [
+        [
+          {
+            "node": "Read CNBC RSS",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read CNBC RSS": {
+      "main": [
+        [
+          {
+            "node": "Normalise CNBC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalise CNBC": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Fetch Cafemutual": {
+      "main": [
+        [
+          {
+            "node": "Extract Cafemutual",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "MC Feeds": {
+      "main": [
+        [
+          {
+            "node": "Read MC RSS",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read MC RSS": {
+      "main": [
+        [
+          {
+            "node": "Normalise MC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Cafemutual": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalise MC": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Load Rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Rules": {
+      "main": [
+        [
+          {
+            "node": "Categorise",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Categorise": {
+      "main": [
+        [
+          {
+            "node": "Save New Articles",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata"
+  }
+}

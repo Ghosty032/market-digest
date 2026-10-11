@@ -1,0 +1,6 @@
+# Secrets and local data: never commit
+.env
+*.sql.bak
+backup*.sql
+data/
+archive/
